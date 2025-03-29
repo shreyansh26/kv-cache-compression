@@ -105,10 +105,42 @@ class KVCache(nn.Module):
         # input_pos: [S], k_val: [B, H, S, D]
         assert input_pos.shape[0] == k_val.shape[2]
 
+        print(input_pos, input_pos.shape)
+
         k_out = self.k_cache
         v_out = self.v_cache
         k_out[:, :, input_pos] = k_val
         v_out[:, :, input_pos] = v_val
+
+        return k_out, v_out
+
+class KVCacheAttentionSink(nn.Module):
+    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16, global_tokens=2, sliding_window=8):
+        super().__init__()
+        cache_shape = (max_batch_size, n_heads, max_cache_size, head_dim)
+
+        self.sliding_window = sliding_window
+        self.global_tokens = global_tokens
+        self.max_cache_size = sliding_window + global_tokens
+
+        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
+        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
+
+    def update(self, input_pos, k_val, v_val):
+        # input_pos: [S], k_val: [B, H, S, D]
+        assert input_pos.shape[0] == k_val.shape[2]
+        seq_len = input_pos[-1] + 1
+
+        k_out = self.k_cache
+        v_out = self.v_cache
+        
+        if seq_len <= self.max_cache_size:
+            k_out[:, :, input_pos] = k_val
+            v_out[:, :, input_pos] = v_val
+            return k_out, v_out
+
+        k_out = torch.cat([self.k_out[:, :, :self.global_tokens, ...], self.k_out[:, :, self.max_cache_size - self.sliding_window + 1:self.max_cache_size, ...], k_val], dim=2)
+        v_out = torch.cat([self.v_out[:, :, :self.global_tokens, ...], self.v_out[:, :, self.max_cache_size - self.sliding_window + 1:self.max_cache_size, ...], v_val], dim=2)
 
         return k_out, v_out
 
