@@ -117,11 +117,12 @@ class KVCache(nn.Module):
 class KVCacheAttentionSink(nn.Module):
     def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16, global_tokens=2, sliding_window=8):
         super().__init__()
-        cache_shape = (max_batch_size, n_heads, max_cache_size, head_dim)
 
         self.sliding_window = sliding_window
         self.global_tokens = global_tokens
         self.max_cache_size = sliding_window + global_tokens
+
+        cache_shape = (max_batch_size, n_heads, self.max_cache_size, head_dim)
 
         self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
