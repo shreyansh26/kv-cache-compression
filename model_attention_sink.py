@@ -127,10 +127,10 @@ class KVCacheAttentionSink(nn.Module):
                 recent_idxs = torch.arange(total_len - self.sliding_window, total_len, device=input_pos.device)
                 keep_idxs = torch.cat([global_idxs, recent_idxs])
                 new_pos = input_pos[keep_idxs]
-                # Update buffers using in-place copy operations to preserve registered buffers.
-                self.pos.copy_(new_pos.unsqueeze(0).unsqueeze(0).expand_as(self.pos))
-                self.k_cache.copy_(k_val.index_select(dim=2, index=keep_idxs))
-                self.v_cache.copy_(v_val.index_select(dim=2, index=keep_idxs))
+
+                self.pos = new_pos.unsqueeze(0).unsqueeze(0).expand_as(self.pos)
+                self.k_cache = k_val.index_select(dim=2, index=keep_idxs)
+                self.v_cache = v_val.index_select(dim=2, index=keep_idxs)
         # Decode
         else:
             idx_to_pop = (self.global_tokens + torch.argmin(self.pos[:, :, self.global_tokens :], dim=-1)).flatten()
