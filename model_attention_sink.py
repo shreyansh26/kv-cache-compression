@@ -111,13 +111,26 @@ class KVCacheAttentionSink(nn.Module):
     
     def update(self, input_pos, k_val, v_val):
         # input_pos: [S], k_val: [B, H, S, D]
-        assert input_pos.shape[0] == k_val.shape[2]
+        total_len = input_pos.shape[0]
+        assert total_len == k_val.shape[2]
 
         # Prefill
-        if input_pos.shape[0] > 1:
-            self.pos[:, :, input_pos] = input_pos
-            self.k_cache[:, :, input_pos] = k_val
-            self.v_cache[:, :, input_pos] = v_val
+        if total_len > 1:
+            if total_len <= self.max_cache_size:
+                self.pos[:, :, input_pos] = input_pos
+                self.k_cache[:, :, input_pos] = k_val
+                self.v_cache[:, :, input_pos] = v_val
+            else:
+                # Reduce prompt size when initial prompt is longer than max cache size
+                # Always keep the first `global_tokens` tokens and the last `sliding_window` tokens.
+                global_idxs = torch.arange(self.global_tokens, device=input_pos.device)
+                recent_idxs = torch.arange(total_len - self.sliding_window, total_len, device=input_pos.device)
+                keep_idxs = torch.cat([global_idxs, recent_idxs])
+                new_pos = input_pos[keep_idxs]
+                # Update buffers using in-place copy operations to preserve registered buffers.
+                self.pos.copy_(new_pos.unsqueeze(0).unsqueeze(0).expand_as(self.pos))
+                self.k_cache.copy_(k_val.index_select(dim=2, index=keep_idxs))
+                self.v_cache.copy_(v_val.index_select(dim=2, index=keep_idxs))
         # Decode
         else:
             idx_to_pop = (self.global_tokens + torch.argmin(self.pos[:, :, self.global_tokens :], dim=-1)).flatten()
