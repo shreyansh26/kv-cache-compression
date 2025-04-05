@@ -364,7 +364,8 @@ def main(
     aggregate_metrics = {
         'tokens_per_sec': [],
         'accept_counts': [],
-        'compression_ratio': [],
+        'compression_ratio_effective': [],
+        'compression_ratio_actual': [],
     }
     start = -1 if compile else 0
 
@@ -439,8 +440,10 @@ def main(
         print(f"Bandwidth achieved: {model_size * generated_tokens_sec / 1e9:.02f} GB/s")
         total_tokens_sec = y.numel() / t
         print(f"FLOPS achieved: {params * total_tokens_sec * 2 / 1e12:.02f} TF/s")
-        print(f"KV Cache Compression Ratio: {model.get_cache_stats(y.shape[-1])['compression_ratio']:.2f}")
-        aggregate_metrics['compression_ratio'].append(model.get_cache_stats(y.shape[-1])['compression_ratio'])
+        print(f"KV Cache Compression Ratio (effective): {model.get_cache_stats(y.shape[-1])[0]['compression_ratio_effective']:.2f}")
+        print(f"KV Cache Compression Ratio (actual): {model.get_cache_stats(y.shape[-1])[1]['compression_ratio_actual']:.2f}")
+        aggregate_metrics['compression_ratio_effective'].append(model.get_cache_stats(y.shape[-1])[0]['compression_ratio_effective'])
+        aggregate_metrics['compression_ratio_actual'].append(model.get_cache_stats(y.shape[-1])[1]['compression_ratio_actual'])
         print()
     print("==========")
     if is_speculative:
@@ -453,7 +456,8 @@ def main(
     print(f"Prompt Length: {prompt_length}")
     print(f"Generated tokens: {max_new_tokens}")
     print(f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}")
-    print(f"Average compression ratio: {torch.mean(torch.tensor(aggregate_metrics['compression_ratio'])).item():.2f}")
+    print(f"Average compression ratio (effective): {torch.mean(torch.tensor(aggregate_metrics['compression_ratio_effective'])).item():.2f}")
+    print(f"Average compression ratio (actual): {torch.mean(torch.tensor(aggregate_metrics['compression_ratio_actual'])).item():.2f}")
     print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
 

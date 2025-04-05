@@ -171,8 +171,9 @@ class KVCacheL2Norm(nn.Module):
         return self.k_cache, self.v_cache
 
     def compression_ratio(self, seq_len):
-        compressed_avg_size = self.max_cache_size * (1 + self.keep_ratio) / 2
-        return ((seq_len - compressed_avg_size) / seq_len)
+        compressed_effective = self.max_cache_size * (1 + self.keep_ratio) / 2
+        compressed_actual = self.max_cache_size
+        return ((seq_len - compressed_effective) / seq_len), ((seq_len - compressed_actual) / seq_len)
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs, keep_ratio: Optional[float] = 1.0, prune_after: Optional[int] = 1024) -> None:
@@ -213,11 +214,13 @@ class Transformer(nn.Module):
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
 
     def get_cache_stats(self, seq_len):
-        stats = {}
+        stats_effective = {}
+        stats_actual = {}
         for layer_idx, layer in enumerate(self.layers):
-            stats[f"compression_ratio_{layer_idx}"] = layer.attention.kv_cache.compression_ratio(seq_len)
-        stats["compression_ratio"] = sum(stats.values()) / len(stats)
-        return stats
+            stats_effective[f"compression_ratio_effective_{layer_idx}"], stats_actual[f"compression_ratio_actual_{layer_idx}"] = layer.attention.kv_cache.compression_ratio(seq_len)
+        stats_effective["compression_ratio_effective"] = sum(stats_effective.values()) / len(stats_effective)
+        stats_actual["compression_ratio_actual"] = sum(stats_actual.values()) / len(stats_actual)
+        return stats_effective, stats_actual
 
     def forward(self, mask: BlockMask, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
