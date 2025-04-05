@@ -104,7 +104,7 @@ class KVCacheL2Norm(nn.Module):
         self.curr_len = 0
 
         cache_shape = (max_batch_size, n_heads, self.max_cache_size, head_dim)
-        pos = torch.full((max_batch_size, 1, self.max_cache_size), -1, dtype=torch.long)
+        pos = torch.full((max_batch_size, n_heads, self.max_cache_size), -1, dtype=torch.long)
 
         self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
@@ -136,23 +136,36 @@ class KVCacheL2Norm(nn.Module):
                 self.pos = input_pos[scoring_sorted_idx_selcted]
                 self.curr_len = self.max_cache_size
         # Decode
-        else:          
+        else:
             if self.curr_len == self.max_cache_size:
                 key_norm = torch.norm(self.k_cache, p=2, dim=-1)
                 key_norm_diff = key_norm.max() - key_norm
                 scoring_priority = key_norm_diff.masked_fill(self.pos == -1, float('inf'))
                 scoring_sorted_idx = torch.argsort(scoring_priority, dim=-1) # [B, H, S] -> in ascending order
-                num_toks_to_remove = (1 - self.keep_ratio) * self.max_cache_size
-                scoring_sorted_idx_selcted = scoring_sorted_idx[num_toks_to_remove:]
-                self.k_cache = torch.cat([self.k_cache.index_select(dim=2, index=scoring_sorted_idx_selcted), torch.zeros(self.k_cache.shape[0], self.k_cache.shape[1], num_toks_to_remove, self.k_cache.shape[-1], device=self.k_cache.device)], dim=2)
-                self.v_cache = torch.cat([self.v_cache.index_select(dim=2, index=scoring_sorted_idx_selcted), torch.zeros(self.v_cache.shape[0], self.v_cache.shape[1], num_toks_to_remove, self.v_cache.shape[-1], device=self.v_cache.device)], dim=2)
-                self.pos = torch.cat([self.pos.index_select(dim=2, index=scoring_sorted_idx_selcted), torch.ones(self.pos.shape[0], self.pos.shape[1], num_toks_to_remove, device=self.pos.device) * -1], dim=2)
-                self.curr_len = self.max_cache_size * self.keep_ratio
+                num_toks_to_remove = int((1 - self.keep_ratio) * self.max_cache_size)
+                scoring_sorted_idx_selcted = scoring_sorted_idx[:, :, num_toks_to_remove:]
+                
+                # Use gather instead of index_select
+                self.k_cache = torch.cat([
+                    torch.gather(self.k_cache, dim=2, index=scoring_sorted_idx_selcted.unsqueeze(-1).expand(-1, -1, -1, self.k_cache.shape[-1])),
+                    torch.zeros(self.k_cache.shape[0], self.k_cache.shape[1], num_toks_to_remove, self.k_cache.shape[-1], device=self.k_cache.device, dtype=self.k_cache.dtype)
+                ], dim=2)
+                
+                self.v_cache = torch.cat([
+                    torch.gather(self.v_cache, dim=2, index=scoring_sorted_idx_selcted.unsqueeze(-1).expand(-1, -1, -1, self.v_cache.shape[-1])),
+                    torch.zeros(self.v_cache.shape[0], self.v_cache.shape[1], num_toks_to_remove, self.v_cache.shape[-1], device=self.v_cache.device, dtype=self.v_cache.dtype)
+                ], dim=2)
+                
+                self.pos = torch.cat([
+                    torch.gather(self.pos.expand(-1, scoring_sorted_idx_selcted.shape[1], -1), dim=2, index=scoring_sorted_idx_selcted),
+                    torch.ones(self.pos.shape[0], scoring_sorted_idx_selcted.shape[1], num_toks_to_remove, device=self.pos.device, dtype=self.pos.dtype) * -1
+                ], dim=2)
+                self.curr_len = self.max_cache_size - num_toks_to_remove
 
             if self.curr_len < self.max_cache_size:
-                self.k_cache[:, :, self.curr_len] = k_val
-                self.v_cache[:, :, self.curr_len] = v_val
-                self.pos[:, :, self.curr_len] = input_pos
+                self.k_cache[:, :, [self.curr_len]] = k_val
+                self.v_cache[:, :, [self.curr_len]] = v_val
+                self.pos[:, :, [self.curr_len]] = input_pos.long()
                 self.curr_len += 1
 
         return self.k_cache, self.v_cache
@@ -179,6 +192,7 @@ class Transformer(nn.Module):
 
         self.keep_ratio = keep_ratio
         self.prune_after = prune_after
+        self.max_cache_size = min(prune_after, config.block_size)
 
     def setup_caches(self, max_batch_size, max_seq_length):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
@@ -218,8 +232,8 @@ class Transformer(nn.Module):
         return logits
 
     @classmethod
-    def from_name(cls, name: str, sliding_window: Optional[int] = None, global_tokens: Optional[int] = None):
-        return cls(ModelArgs.from_name(name), sliding_window, global_tokens)
+    def from_name(cls, name: str, keep_ratio: Optional[float] = None, prune_after: Optional[int] = None):
+        return cls(ModelArgs.from_name(name), keep_ratio=keep_ratio, prune_after=prune_after)
 
 
 class TransformerBlock(nn.Module):
