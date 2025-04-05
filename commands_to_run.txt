@@ -2,4 +2,4 @@ python generate.py --compile --checkpoint_path checkpoints/$MODEL_REPO/model.pth
 
 python generate_attention_sink.py --compile --checkpoint_path checkpoints/$MODEL_REPO/model.pth --prompt "Hello, my name is"
 
-python generate_l2_norm.py --compile --checkpoint_path checkpoints/$MODEL_REPO/model.pth --prompt "Hello, my name is" --prune_after 64
+python generate_l2_norm.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --prompt "Hello, my name is" --prune_after 64 (compile doesn't work, yet)
