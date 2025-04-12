@@ -1,4 +1,45 @@
-# gpt-fast
+
+# KV Cache Compression
+
+This project is a fork of the `gpt-fast` project, with added support for KV cache compression. It currently supports two algorithms - 
+
+1. Attention Sink ([Paper](https://arxiv.org/abs/2309.17453))
+2. L2 Norm compression ([Paper](https://arxiv.org/abs/2406.11430))
+
+## Important files
+
+- `kv_cache_compress.py` - Contains the implementation of the two algorithms.
+- `model_kv_cache_compression.py` - Defines the `Transformer` class with KV cache compression.
+- `generate_kv_cache_compression.py` - Generation logic having support for KV cache compression (also supports the default no compression path)
+
+## How to run?
+
+First set `$MODEL_REPO` to the model you want to run and perform the conversion using `prepare.sh`.
+
+```bash
+export MODEL_REPO=meta-llama/Llama-3.1-8B-Instruct
+./scripts/prepare.sh $MODEL_REPO
+```
+
+Then run the generation script with the desired compression type
+
+```bash
+python generate_kv_cache_compression.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --prompt "Hello, my name is" --compression_type attention_sink
+```
+
+```bash
+python generate_kv_cache_compression.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --prompt "Hello, my name is" --compression_type l2_norm
+```
+
+Or, with no KV Cache compression - 
+
+```bash
+python generate_kv_cache_compression.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --prompt "Hello, my name is"
+```
+
+
+---------
+# (Original README) gpt-fast
 Simple and efficient pytorch-native transformer text generation.
 
 Featuring:
