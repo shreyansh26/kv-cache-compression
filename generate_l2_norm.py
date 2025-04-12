@@ -486,7 +486,7 @@ if __name__ == '__main__':
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
 
-    # Attention Sink args
+    # L2 Norm args
     parser.add_argument('--keep_ratio', type=float, default=0.8, help='Keep ratio.')
     parser.add_argument('--prune_after', type=int, default=64, help='Prune after.')
 
