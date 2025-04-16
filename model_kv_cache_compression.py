@@ -127,6 +127,7 @@ class Transformer(nn.Module):
         self.mask_cache: Optional[Tensor] = None
         self.max_batch_size = -1
         self.max_seq_length = -1
+        self.max_cache_size = -1
         self.get_mask_mod = get_mask_mod
         self.kv_cache_class = KVCache
 
@@ -137,6 +138,7 @@ class Transformer(nn.Module):
         max_seq_length = find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
+        self.max_cache_size = max_seq_length
         dtype = self.output.weight.dtype
         # For quantized layers, dtype is encoded in scales
         if hasattr(self.output, "scales"):
@@ -301,7 +303,9 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
-        y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
+        # y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
+        is_causal = seqlen > 1
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=is_causal, enable_gqa=(self.n_head != self.n_local_heads))
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
