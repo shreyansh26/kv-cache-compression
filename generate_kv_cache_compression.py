@@ -14,7 +14,7 @@ import torch._dynamo.config
 import torch._inductor.config
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from model_kv_cache_compression import TransformerL2Norm, TransformerAttentionSink
+from model_kv_cache_compression import TransformerL2Norm, TransformerAttentionSink, Transformer
 
 def device_sync(device):
     if "cuda" in device:
@@ -39,7 +39,6 @@ create_block_mask = torch.compile(create_block_mask)
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from model_attention_sink import Transformer
 from tokenizer import get_tokenizer
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
@@ -240,7 +239,7 @@ def _load_model(checkpoint_path, device, precision, use_tp, compression_type, sl
         elif compression_type == 'attention_sink':
             model = TransformerAttentionSink.from_name(checkpoint_path.parent.name, sliding_window=sliding_window, global_tokens=global_tokens)
         else:
-            model = Transformer.from_name(checkpoint_path.parent.name, sliding_window=sliding_window, global_tokens=global_tokens)
+            model = Transformer.from_name(checkpoint_path.parent.name)
 
     if "int8" in str(checkpoint_path):
         print("Using int8 weight-only quantization!")
