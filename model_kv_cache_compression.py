@@ -114,12 +114,13 @@ class KVCache(nn.Module):
         return k_out, v_out
 
 class Transformer(nn.Module):
-    def __init__(self, config: ModelArgs) -> None:
+    def __init__(self, config: ModelArgs, snapkv_enabled: bool = False) -> None:
         super().__init__()
         self.config = config
+        self.snapkv_enabled = snapkv_enabled
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
-        self.layers = nn.ModuleList(TransformerBlock(config) for _ in range(config.n_layer))
+        self.layers = nn.ModuleList(TransformerBlock(config, snapkv_enabled=self.snapkv_enabled) for _ in range(config.n_layer))
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
@@ -248,9 +249,9 @@ class TransformerL2Norm(Transformer):
         return cls(ModelArgs.from_name(name), keep_ratio=keep_ratio, prune_after=prune_after)
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: ModelArgs) -> None:
+    def __init__(self, config: ModelArgs, snapkv_enabled: bool = False) -> None:
         super().__init__()
-        self.attention = Attention(config)
+        self.attention = Attention(config, snapkv_enabled=snapkv_enabled)
         self.feed_forward = FeedForward(config)
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
@@ -262,7 +263,7 @@ class TransformerBlock(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelArgs, snapkv_enabled: bool = False):
         super().__init__()
         assert config.dim % config.n_head == 0
 
@@ -276,6 +277,7 @@ class Attention(nn.Module):
         self.head_dim = config.head_dim
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
+        self.snapkv_enabled = snapkv_enabled
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
@@ -305,12 +307,44 @@ class Attention(nn.Module):
 
         # y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
         is_causal = seqlen > 1
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=is_causal, enable_gqa=(self.n_head != self.n_local_heads))
+        if is_causal:
+            # Compute attention but also use the attention scores to prune KV Cache if SnapKV is enabled
+            y, scores = self.manual_attention(q, k, v, is_causal=True, enable_gqa=(self.n_head != self.n_local_heads))
+            if self.snapkv_enabled:
+                self.kv_cache.prune_cache(scores)
+        else:
+            y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
         y = self.wo(y)
         return y
+
+    def repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        From - https://github.com/huggingface/transformers/blob/4f58fc9c823c43b67a6ce1c44be28f8aecc3c8d9/src/transformers/models/llama/modeling_llama.py#L178
+        This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+        num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+        """
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+    def manual_attention(self, q: Tensor, k: Tensor, v: Tensor, is_causal: bool, enable_gqa: bool):
+        if enable_gqa:
+            k = self.repeat_kv(k, self.n_head // self.n_local_heads)
+            v = self.repeat_kv(v, self.n_head // self.n_local_heads)
+
+        scores = torch.einsum("b h i d, b h j d -> b h i j", q, k) * (self.head_dim ** -0.5)
+        if is_causal:
+            mask = torch.tril(torch.ones(scores.size(2), scores.size(3), device=scores.device)).bool()
+            scores = scores.masked_fill(~mask, float("-inf"))
+
+        scores = F.softmax(scores, dim=-1)
+        out = torch.einsum("b h i j, b h j d -> b h i d", scores, v)
+        return out, scores
 
 
 class FeedForward(nn.Module):
