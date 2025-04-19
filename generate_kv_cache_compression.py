@@ -14,7 +14,7 @@ import torch._dynamo.config
 import torch._inductor.config
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from model_kv_cache_compression import TransformerL2Norm, TransformerAttentionSink, Transformer
+from model_kv_cache_compression import TransformerL2Norm, TransformerAttentionSink, TransformerSnapKV, Transformer
 
 def device_sync(device):
     if "cuda" in device:
@@ -180,9 +180,9 @@ def generate(
     device, dtype = prompt.device, prompt.dtype
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
     with torch.device(device):
-        model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
+        model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length, prompt_size=T)
         if is_speculative and draft_model is not model:
-            draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
+            draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length, prompt_size=T)
 
     # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.empty(batch_size, T_new, dtype=dtype, device=device)
@@ -231,13 +231,15 @@ def encode_tokens(tokenizer, string, bos=True, device=default_device):
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
-def _load_model(checkpoint_path, device, precision, use_tp, compression_type, sliding_window, global_tokens, keep_ratio, prune_after):
+def _load_model(checkpoint_path, device, precision, use_tp, compression_type, sliding_window, global_tokens, keep_ratio, prune_after, window_size, compress_length, kernel_size):
     use_cuda = 'cuda' in device
     with torch.device('meta'):
         if compression_type == 'l2_norm':
             model = TransformerL2Norm.from_name(checkpoint_path.parent.name, keep_ratio=keep_ratio, prune_after=prune_after)
         elif compression_type == 'attention_sink':
             model = TransformerAttentionSink.from_name(checkpoint_path.parent.name, sliding_window=sliding_window, global_tokens=global_tokens)
+        elif compression_type == 'snapkv':
+            model = TransformerSnapKV.from_name(checkpoint_path.parent.name, window_size=window_size, compress_length=compress_length, kernel_size=kernel_size)
         else:
             model = Transformer.from_name(checkpoint_path.parent.name)
 
@@ -309,6 +311,9 @@ def main(
     keep_ratio: Optional[float] = None,
     prune_after: Optional[int] = None,
     compression_type: Optional[str] = None,
+    window_size: Optional[int] = None,
+    compress_length: Optional[int] = None,
+    kernel_size: Optional[int] = None,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -333,7 +338,7 @@ def main(
 
     print("Loading model ...")
     t0 = time.time()
-    model = _load_model(checkpoint_path, device, precision, use_tp, compression_type, sliding_window, global_tokens, keep_ratio, prune_after)
+    model = _load_model(checkpoint_path, device, precision, use_tp, compression_type, sliding_window, global_tokens, keep_ratio, prune_after, window_size, compress_length, kernel_size)
 
     if is_speculative:
         draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
@@ -453,7 +458,7 @@ def main(
         if compression_type == 'attention_sink':
             print(f"KV Cache Compression Ratio: {model.get_cache_stats(y.shape[-1])['compression_ratio']:.2f}")
             aggregate_metrics['compression_ratio'].append(model.get_cache_stats(y.shape[-1])['compression_ratio'])
-        elif compression_type == 'l2_norm':
+        elif compression_type == 'l2_norm' or compression_type == 'snapkv':
             print(f"KV Cache Compression Ratio (effective): {model.get_cache_stats(y.shape[-1])[0]['compression_ratio_effective']:.2f}")
             print(f"KV Cache Compression Ratio (actual): {model.get_cache_stats(y.shape[-1])[1]['compression_ratio_actual']:.2f}")
             aggregate_metrics['compression_ratio_effective'].append(model.get_cache_stats(y.shape[-1])[0]['compression_ratio_effective'])
@@ -472,7 +477,7 @@ def main(
     print(f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}")
     if compression_type == 'attention_sink':
         print(f"Average compression ratio: {torch.mean(torch.tensor(aggregate_metrics['compression_ratio'])).item():.2f}")
-    elif compression_type == 'l2_norm':
+    elif compression_type == 'l2_norm' or compression_type == 'snapkv':
         print(f"Average compression ratio (effective): {torch.mean(torch.tensor(aggregate_metrics['compression_ratio_effective'])).item():.2f}")
         print(f"Average compression ratio (actual): {torch.mean(torch.tensor(aggregate_metrics['compression_ratio_actual'])).item():.2f}")
     print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
@@ -504,7 +509,7 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
 
     # Compression type
-    parser.add_argument('--compression_type', type=str, choices=['l2_norm', 'attention_sink'], help='Compression type.')
+    parser.add_argument('--compression_type', type=str, choices=['l2_norm', 'attention_sink', 'snapkv'], help='Compression type.')
 
     # Attention Sink args
     parser.add_argument('--sliding_window', type=int, default=32, help='Sliding window size.')
@@ -514,11 +519,17 @@ if __name__ == '__main__':
     parser.add_argument('--keep_ratio', type=float, default=0.8, help='Keep ratio.')
     parser.add_argument('--prune_after', type=int, default=64, help='Prune after.')
 
+    # SnapKV args
+    parser.add_argument('--window_size', type=int, default=8, help='Window size.')
+    parser.add_argument('--compress_length', type=int, default=40, help='Compress length.')
+    parser.add_argument('--kernel_size', type=int, default=5, help='Kernel size.')
+
 
     args = parser.parse_args()
     print(f"Compression type: {args.compression_type}")
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device, args.sliding_window, args.global_tokens, args.keep_ratio, args.prune_after, args.compression_type
+        args.speculate_k, args.device, args.sliding_window, args.global_tokens, args.keep_ratio, args.prune_after, args.compression_type,
+        args.window_size, args.compress_length, args.kernel_size
     )
