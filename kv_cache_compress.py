@@ -146,3 +146,85 @@ class KVCacheL2Norm(nn.Module):
         stats_effective["compression_ratio_effective"] = sum(stats_effective.values()) / len(stats_effective)
         stats_actual["compression_ratio_actual"] = sum(stats_actual.values()) / len(stats_actual)
         return stats_effective, stats_actual
+
+
+class KVCacheSnapKV(nn.Module):
+    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16, window_size=8, compress_length=40, kernel_size=5):
+        super().__init__()
+        self.window_size = window_size
+        self.compress_length = compress_length
+        self.max_cache_size = max_seq_length
+        self.kernel_size = kernel_size
+        
+        cache_shape = (max_batch_size, n_heads, self.max_cache_size, head_dim)
+        pos = torch.full((max_batch_size, n_heads, self.max_cache_size), -1, dtype=torch.long)
+
+        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
+        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
+        self.register_buffer('pos', pos)
+        self.ctr = 0
+
+        self.pool = torch.nn.AvgPool1d(
+            self.kernel_size,
+            stride=1,
+            padding=self.kernel_size // 2
+        )
+    
+    def update(self, input_pos, k_val, v_val):
+        # input_pos: [S], k_val: [B, H, S, D]
+        total_len = input_pos.shape[0]
+        assert total_len == k_val.shape[2]
+
+        self.pos[:, :, input_pos] = input_pos.long()    
+        self.k_cache[:, :, input_pos] = k_val
+        self.v_cache[:, :, input_pos] = v_val
+
+        # Count number of prefill tokens
+        if total_len > 1:
+            self.ctr = total_len
+
+        return self.k_cache, self.v_cache
+
+    def prune_cache(self, input_pos: torch.Tensor, attn_scores: torch.Tensor, n_kv_head: int):
+        total_len = input_pos.shape[0]
+        head_dim = self.k_cache.shape[-1]
+        b, nh, lq, lk = attn_scores.shape
+        n_rep = nh // n_kv_head
+        
+        if total_len > self.compress_length:
+            attn_scores_grouped = attn_scores.view(b, n_kv_head, n_rep, lq, lk)
+            attn_scores_agg = attn_scores_grouped.sum(dim=2) # Sum over query heads sharing KV head. Shape: [B, n_kv_heads, L_obs, L_prefix]
+            attn_weights_sum = attn_scores_agg[:, :, -self.window_size:, : total_len-self.window_size].sum(dim=-2)
+            attn_cache = self.pool(attn_weights_sum)
+
+            indices = attn_cache.topk(self.compress_length - self.window_size, dim=-1).indices
+            indices_expanded = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+            pos_expanded = indices.unsqueeze(-1).expand(-1, -1, -1, 1).squeeze(-1)
+
+            k_past_compress = self.k_cache[:, :, :total_len-self.window_size, :].gather(dim = 2, index = indices_expanded)
+            v_past_compress = self.v_cache[:, :, :total_len-self.window_size, :].gather(dim = 2, index = indices_expanded)
+            pos_compress = self.pos[:, :, :total_len-self.window_size].gather(dim = 2, index = pos_expanded)
+            k_cur = self.k_cache[:, :, total_len-self.window_size:total_len, :]
+            v_cur = self.v_cache[:, :, total_len-self.window_size:total_len, :]
+            pos_cur = self.pos[:, :, total_len-self.window_size:total_len]
+            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+            pos_states = torch.cat([pos_compress, pos_cur], dim = 2)
+
+            self.k_cache[:, :, torch.arange(self.compress_length), :] = key_states
+            self.v_cache[:, :, torch.arange(self.compress_length), :] = value_states
+            self.pos[:, :, torch.arange(self.compress_length)] = pos_states
+
+    def compression_ratio(self, seq_len):
+        compressed_effective = self.max_cache_size - self.ctr + self.compress_length
+        compressed_actual = self.max_cache_size
+        return abs((seq_len - compressed_effective) / seq_len), abs((seq_len - compressed_actual) / seq_len)
+
+    def get_cache_stats(self, seq_len):
+        stats_effective = {}
+        stats_actual = {}
+        for layer_idx, layer in enumerate(self.layers):
+            stats_effective[f"compression_ratio_effective_{layer_idx}"], stats_actual[f"compression_ratio_actual_{layer_idx}"] = layer.attention.kv_cache.compression_ratio(seq_len)
+        stats_effective["compression_ratio_effective"] = sum(stats_effective.values()) / len(stats_effective)
+        stats_actual["compression_ratio_actual"] = sum(stats_actual.values()) / len(stats_actual)
+        return stats_effective, stats_actual
