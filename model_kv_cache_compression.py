@@ -17,7 +17,7 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from kv_cache_compress import KVCacheAttentionSink, KVCacheL2Norm
+from kv_cache_compress import KVCacheAttentionSink, KVCacheL2Norm, KVCacheSnapKV
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
@@ -132,7 +132,7 @@ class Transformer(nn.Module):
         self.get_mask_mod = get_mask_mod
         self.kv_cache_class = KVCache
 
-    def setup_caches(self, max_batch_size, max_seq_length):
+    def setup_caches(self, max_batch_size, max_seq_length, prompt_size=None):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
         head_dim = self.config.dim // self.config.n_head
@@ -177,7 +177,7 @@ class TransformerAttentionSink(Transformer):
 
         self.kv_cache_class = KVCacheAttentionSink
 
-    def setup_caches(self, max_batch_size, max_seq_length):
+    def setup_caches(self, max_batch_size, max_seq_length, prompt_size=None):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
         head_dim = self.config.dim // self.config.n_head
@@ -216,7 +216,7 @@ class TransformerL2Norm(Transformer):
 
         self.kv_cache_class = KVCacheL2Norm
 
-    def setup_caches(self, max_batch_size, max_seq_length):
+    def setup_caches(self, max_batch_size, max_seq_length, prompt_size=None):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
         head_dim = self.config.dim // self.config.n_head
@@ -247,6 +247,50 @@ class TransformerL2Norm(Transformer):
     @classmethod
     def from_name(cls, name: str, keep_ratio: Optional[float] = None, prune_after: Optional[int] = None):
         return cls(ModelArgs.from_name(name), keep_ratio=keep_ratio, prune_after=prune_after)
+
+class TransformerSnapKV(Transformer):
+    def __init__(self, config: ModelArgs, window_size: int = 8, compress_length: int = 40, kernel_size: int = 5) -> None:
+        super().__init__(config, snapkv_enabled=True)
+
+        self.window_size = window_size
+        self.compress_length = compress_length
+        self.kernel_size = kernel_size
+        self.kv_cache_class = KVCacheSnapKV
+
+    def setup_caches(self, max_batch_size, max_seq_length, prompt_size=None):
+        if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
+            return
+        head_dim = self.config.dim // self.config.n_head
+        max_seq_length = find_multiple(max_seq_length, 8)
+        self.max_seq_length = max_seq_length
+        self.max_batch_size = max_batch_size
+        # self.max_cache_size = max_seq_length - prompt_size + self.compress_length
+        self.max_cache_size = max_seq_length
+        dtype = self.output.weight.dtype
+        # For quantized layers, dtype is encoded in scales
+        if hasattr(self.output, "scales"):
+            dtype = self.output.scales.dtype
+        elif hasattr(self.output, "scales_and_zeros"):
+            dtype = self.output.scales_and_zeros.dtype
+        for b in self.layers:
+            b.attention.kv_cache = self.kv_cache_class(self.max_batch_size, self.max_cache_size, self.config.n_local_heads, self.config.head_dim, dtype=self.output.weight.dtype, window_size=self.window_size, compress_length=self.compress_length, kernel_size=self.kernel_size)
+
+        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
+
+    def get_cache_stats(self, seq_len):
+        stats_effective = {}
+        stats_actual = {}
+        for layer_idx, layer in enumerate(self.layers):
+            stats_effective[f"compression_ratio_effective_{layer_idx}"], stats_actual[f"compression_ratio_actual_{layer_idx}"] = layer.attention.kv_cache.compression_ratio(seq_len)
+        stats_effective["compression_ratio_effective"] = sum(stats_effective.values()) / len(stats_effective)
+        stats_actual["compression_ratio_actual"] = sum(stats_actual.values()) / len(stats_actual)
+
+        return stats_effective, stats_actual
+
+    @classmethod
+    def from_name(cls, name: str, window_size: Optional[int] = None, compress_length: Optional[int] = None, kernel_size: Optional[int] = None):
+        return cls(ModelArgs.from_name(name), window_size=window_size, compress_length=compress_length, kernel_size=kernel_size)
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, config: ModelArgs, snapkv_enabled: bool = False) -> None:
@@ -311,9 +355,10 @@ class Attention(nn.Module):
             # Compute attention but also use the attention scores to prune KV Cache if SnapKV is enabled
             y, scores = self.manual_attention(q, k, v, is_causal=True, enable_gqa=(self.n_head != self.n_local_heads))
             if self.snapkv_enabled:
-                self.kv_cache.prune_cache(scores)
+                self.kv_cache.prune_cache(input_pos, scores, n_kv_head=self.n_local_heads)
         else:
             y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
+            # y, _ = self.manual_attention(q, k, v, is_causal=False, enable_gqa=(self.n_head != self.n_local_heads))
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
