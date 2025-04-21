@@ -14,7 +14,7 @@ import torch._dynamo.config
 import torch._inductor.config
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from model_kv_cache_compression import TransformerL2Norm, TransformerAttentionSink, TransformerSnapKV, Transformer
+from model_kv_cache_compression import TransformerL2Norm, TransformerAttentionSink, TransformerSnapKV, TransformerHeavyHitter, Transformer
 
 def device_sync(device):
     if "cuda" in device:
@@ -231,7 +231,7 @@ def encode_tokens(tokenizer, string, bos=True, device=default_device):
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
-def _load_model(checkpoint_path, device, precision, use_tp, compression_type, sliding_window, global_tokens, keep_ratio, prune_after, window_size, compress_length, kernel_size):
+def _load_model(checkpoint_path, device, precision, use_tp, compression_type, sliding_window, global_tokens, keep_ratio, prune_after, window_size, compress_length, kernel_size, history_window_size, attn_thresholding, h2o_max_cache_size):
     use_cuda = 'cuda' in device
     with torch.device('meta'):
         if compression_type == 'l2_norm':
@@ -240,6 +240,8 @@ def _load_model(checkpoint_path, device, precision, use_tp, compression_type, sl
             model = TransformerAttentionSink.from_name(checkpoint_path.parent.name, sliding_window=sliding_window, global_tokens=global_tokens)
         elif compression_type == 'snapkv':
             model = TransformerSnapKV.from_name(checkpoint_path.parent.name, window_size=window_size, compress_length=compress_length, kernel_size=kernel_size)
+        elif compression_type == 'heavy_hitter':
+            model = TransformerHeavyHitter.from_name(checkpoint_path.parent.name, history_window_size=history_window_size, attn_thresholding=attn_thresholding, h2o_max_cache_size=h2o_max_cache_size)
         else:
             model = Transformer.from_name(checkpoint_path.parent.name)
 
@@ -314,6 +316,9 @@ def main(
     window_size: Optional[int] = None,
     compress_length: Optional[int] = None,
     kernel_size: Optional[int] = None,
+    history_window_size: Optional[int] = None,
+    attn_thresholding: Optional[bool] = None,
+    h2o_max_cache_size: Optional[int] = None,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -338,7 +343,7 @@ def main(
 
     print("Loading model ...")
     t0 = time.time()
-    model = _load_model(checkpoint_path, device, precision, use_tp, compression_type, sliding_window, global_tokens, keep_ratio, prune_after, window_size, compress_length, kernel_size)
+    model = _load_model(checkpoint_path, device, precision, use_tp, compression_type, sliding_window, global_tokens, keep_ratio, prune_after, window_size, compress_length, kernel_size, history_window_size, attn_thresholding, h2o_max_cache_size)
 
     if is_speculative:
         draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
@@ -455,7 +460,7 @@ def main(
         print(f"Bandwidth achieved: {model_size * generated_tokens_sec / 1e9:.02f} GB/s")
         total_tokens_sec = y.numel() / t
         print(f"FLOPS achieved: {params * total_tokens_sec * 2 / 1e12:.02f} TF/s")
-        if compression_type == 'attention_sink':
+        if compression_type == 'attention_sink' or compression_type == 'heavy_hitter':
             print(f"KV Cache Compression Ratio: {model.get_cache_stats(y.shape[-1])['compression_ratio']:.2f}")
             aggregate_metrics['compression_ratio'].append(model.get_cache_stats(y.shape[-1])['compression_ratio'])
         elif compression_type == 'l2_norm' or compression_type == 'snapkv':
@@ -475,7 +480,7 @@ def main(
     print(f"Prompt Length: {prompt_length}")
     print(f"Generated tokens: {max_new_tokens}")
     print(f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}")
-    if compression_type == 'attention_sink':
+    if compression_type == 'attention_sink' or compression_type == 'heavy_hitter':
         print(f"Average compression ratio: {torch.mean(torch.tensor(aggregate_metrics['compression_ratio'])).item():.2f}")
     elif compression_type == 'l2_norm' or compression_type == 'snapkv':
         print(f"Average compression ratio (effective): {torch.mean(torch.tensor(aggregate_metrics['compression_ratio_effective'])).item():.2f}")
@@ -509,7 +514,7 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
 
     # Compression type
-    parser.add_argument('--compression_type', type=str, choices=['l2_norm', 'attention_sink', 'snapkv'], help='Compression type.')
+    parser.add_argument('--compression_type', type=str, choices=['l2_norm', 'attention_sink', 'snapkv', 'heavy_hitter'], help='Compression type.')
 
     # Attention Sink args
     parser.add_argument('--sliding_window', type=int, default=32, help='Sliding window size.')
@@ -524,6 +529,11 @@ if __name__ == '__main__':
     parser.add_argument('--compress_length', type=int, default=40, help='Compress length.')
     parser.add_argument('--kernel_size', type=int, default=5, help='Kernel size.')
 
+    # Heavy Hitter args
+    parser.add_argument('--history_window_size', type=int, default=1, help='History window size.')
+    parser.add_argument('--attn_thresholding', type=bool, default=False, help='Attn thresholding.')
+    parser.add_argument('--h2o_max_cache_size', type=int, default=64, help='H2O max cache size.')
+
 
     args = parser.parse_args()
     print(f"Compression type: {args.compression_type}")
@@ -531,5 +541,5 @@ if __name__ == '__main__':
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
         args.speculate_k, args.device, args.sliding_window, args.global_tokens, args.keep_ratio, args.prune_after, args.compression_type,
-        args.window_size, args.compress_length, args.kernel_size
+        args.window_size, args.compress_length, args.kernel_size, args.history_window_size, args.attn_thresholding, args.h2o_max_cache_size
     )
