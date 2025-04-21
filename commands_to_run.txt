@@ -13,3 +13,5 @@ python generate_kv_cache_compression.py --checkpoint_path checkpoints/$MODEL_REP
 python generate_kv_cache_compression.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --prompt "Hello, my name is"
 
 python generate_kv_cache_compression.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --prompt "Hello, my name is Victoria and I’m the owner of Sweet Treats Bakery. I opened my bakery in the charming town of Willow Creek, where everyone knows each other and the community comes together to support their local businesses. My bakery has been a staple in the town for years, serving up the most delicious baked goods, cakes, and pastries that make everyone’s taste buds dance with joy." --compression_type snapkv
+
+python generate_kv_cache_compression.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --prompt "Hello, my name is" --compression_type heavy_hitter
