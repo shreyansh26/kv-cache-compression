@@ -17,7 +17,7 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from kv_cache_compress import KVCacheAttentionSink, KVCacheL2Norm, KVCacheSnapKV
+from kv_cache_compress import KVCacheAttentionSink, KVCacheL2Norm, KVCacheSnapKV, KVCacheHeavyHitter
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
@@ -114,13 +114,13 @@ class KVCache(nn.Module):
         return k_out, v_out
 
 class Transformer(nn.Module):
-    def __init__(self, config: ModelArgs, snapkv_enabled: bool = False) -> None:
+    def __init__(self, config: ModelArgs, snapkv_enabled: bool = False, heavy_hitter_enabled: bool = False) -> None:
         super().__init__()
         self.config = config
         self.snapkv_enabled = snapkv_enabled
-
+        self.heavy_hitter_enabled = heavy_hitter_enabled
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
-        self.layers = nn.ModuleList(TransformerBlock(config, snapkv_enabled=self.snapkv_enabled) for _ in range(config.n_layer))
+        self.layers = nn.ModuleList(TransformerBlock(config, snapkv_enabled=self.snapkv_enabled, heavy_hitter_enabled=self.heavy_hitter_enabled) for _ in range(config.n_layer))
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
@@ -291,11 +291,61 @@ class TransformerSnapKV(Transformer):
     def from_name(cls, name: str, window_size: Optional[int] = None, compress_length: Optional[int] = None, kernel_size: Optional[int] = None):
         return cls(ModelArgs.from_name(name), window_size=window_size, compress_length=compress_length, kernel_size=kernel_size)
 
+class TransformerHeavyHitter(Transformer):
+    def __init__(self, config: ModelArgs, history_window_size: int = 1, attn_thresholding: bool = False, h2o_max_cache_size: int = 64) -> None:
+        # Pass heavy_hitter_enabled=True to signal Attention module
+        super().__init__(config, heavy_hitter_enabled=True)
+
+        self.history_window_size = history_window_size
+        self.attn_thresholding = attn_thresholding
+        self.max_cache_size = h2o_max_cache_size # Heavy hitter typically uses full size
+
+        self.kv_cache_class = KVCacheHeavyHitter
+
+    def setup_caches(self, max_batch_size, max_seq_length, prompt_size=None):
+        # Standard setup, almost identical to base Transformer
+        if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
+            return
+        head_dim = self.config.dim // self.config.n_head
+        # Ensure max_seq_length matches what HeavyHitter expects if it's different from block_size
+        # For simplicity here, we assume max_seq_length <= config.block_size
+        self.max_seq_length = find_multiple(max_seq_length, 8)
+        self.max_batch_size = max_batch_size
+        dtype = self.output.weight.dtype
+        if hasattr(self.output, "scales"):
+            dtype = self.output.scales.dtype
+        elif hasattr(self.output, "scales_and_zeros"):
+            dtype = self.output.scales_and_zeros.dtype
+
+        for b in self.layers:
+            # Instantiate the HeavyHitter cache with specific args
+            b.attention.kv_cache = self.kv_cache_class(
+                self.max_batch_size,
+                self.max_cache_size, # Use the potentially adjusted size
+                self.config.n_local_heads,
+                self.config.head_dim,
+                dtype=dtype,
+                history_window_size=self.history_window_size,
+                attn_thresholding=self.attn_thresholding
+            )
+
+        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
+
+    def get_cache_stats(self, seq_len):
+        stats = {}
+        for layer_idx, layer in enumerate(self.layers):
+            stats[f"compression_ratio_{layer_idx}"] = layer.attention.kv_cache.compression_ratio(seq_len)
+        stats["compression_ratio"] = sum(stats.values()) / len(stats)
+        return stats
+
+    @classmethod
+    def from_name(cls, name: str, history_window_size: Optional[int] = 1, attn_thresholding: Optional[bool] = False, h2o_max_cache_size: Optional[int] = 64):
+        return cls(ModelArgs.from_name(name), history_window_size=history_window_size, attn_thresholding=attn_thresholding, h2o_max_cache_size=h2o_max_cache_size)
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: ModelArgs, snapkv_enabled: bool = False) -> None:
+    def __init__(self, config: ModelArgs, snapkv_enabled: bool = False, heavy_hitter_enabled: bool = False) -> None:
         super().__init__()
-        self.attention = Attention(config, snapkv_enabled=snapkv_enabled)
+        self.attention = Attention(config, snapkv_enabled=snapkv_enabled, heavy_hitter_enabled=heavy_hitter_enabled)
         self.feed_forward = FeedForward(config)
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
@@ -307,7 +357,7 @@ class TransformerBlock(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, config: ModelArgs, snapkv_enabled: bool = False):
+    def __init__(self, config: ModelArgs, snapkv_enabled: bool = False, heavy_hitter_enabled: bool = False):
         super().__init__()
         assert config.dim % config.n_head == 0
 
@@ -322,6 +372,7 @@ class Attention(nn.Module):
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
         self.snapkv_enabled = snapkv_enabled
+        self.heavy_hitter_enabled = heavy_hitter_enabled
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
@@ -349,16 +400,26 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
-        # y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
-        is_causal = seqlen > 1
-        if is_causal:
-            # Compute attention but also use the attention scores to prune KV Cache if SnapKV is enabled
-            y, scores = self.manual_attention(q, k, v, is_causal=True, enable_gqa=(self.n_head != self.n_local_heads))
-            if self.snapkv_enabled:
-                self.kv_cache.prune_cache(input_pos, scores, n_kv_head=self.n_local_heads)
-        else:
+        compute_scores_manually = self.heavy_hitter_enabled or self.snapkv_enabled or seqlen > 1
+
+        if compute_scores_manually:
+            # Calculate attention and scores manually
+            y, scores = self.manual_attention(q, k, v, is_causal=(seqlen > 1), enable_gqa=(self.n_head != self.n_local_heads))
+
+            # Update SnapKV cache if enabled
+            if self.snapkv_enabled and seqlen > 1: # SnapKV prune happens during prefill/longer sequences
+                 self.kv_cache.prune_cache(input_pos, scores, n_kv_head=self.n_local_heads)
+
+            # Update Heavy Hitter attention history if enabled
+            # This happens during decoding (seqlen == 1) using the scores from the current step
+            if self.heavy_hitter_enabled and seqlen == 1:
+                # Ensure scores have the right shape [B, H, 1, S_cache] for update_attn_history
+                # manual_attention returns [B, H, S_q, S_kv] -> [B, H, 1, S_kv] for decode
+                assert scores.shape[2] == 1, "Scores should have query dim 1 during decoding"
+                self.kv_cache.update_attn_history(scores)
+
+        else: # Decoding and neither SnapKV nor HeavyHitter enabled
             y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
-            # y, _ = self.manual_attention(q, k, v, is_causal=False, enable_gqa=(self.n_head != self.n_local_heads))
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
