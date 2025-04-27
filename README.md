@@ -1,14 +1,16 @@
 
 # KV Cache Compression
 
-This project is a fork of the `gpt-fast` project, with added support for KV cache compression. It currently supports two algorithms - 
+This project is a fork of the `gpt-fast` project, with added support for KV cache compression. It currently supports the following algorithms - 
 
 1. Attention Sink ([Paper](https://arxiv.org/abs/2309.17453))
 2. L2 Norm compression ([Paper](https://arxiv.org/abs/2406.11430))
+3. SnapKV ([Paper](https://arxiv.org/abs/2404.14469))
+4. H2O - Heavy Hitter ([Paper](https://arxiv.org/abs/2306.14048))
 
 ## Important files
 
-- `kv_cache_compress.py` - Contains the implementation of the two algorithms.
+- `kv_cache_compress.py` - Contains the implementation of the KVCache compression algorithms.
 - `model_kv_cache_compression.py` - Defines the `Transformer` class with KV cache compression.
 - `generate_kv_cache_compression.py` - Generation logic having support for KV cache compression (also supports the default no compression path)
 
@@ -21,14 +23,49 @@ export MODEL_REPO=meta-llama/Llama-3.1-8B-Instruct
 ./scripts/prepare.sh $MODEL_REPO
 ```
 
-Then run the generation script with the desired compression type
+Then run the generation script with the desired compression type - 
+
+### Attention Sink
+
+Default parameters - 
+- Sliding window = 32     
+- Global tokens = 2
 
 ```bash
 python generate_kv_cache_compression.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --prompt "Hello, my name is" --compression_type attention_sink
 ```
 
+### L2 Norm
+
+Default parameters - 
+- Keep ratio = 0.8  
+- Prune after = 64
+
 ```bash
 python generate_kv_cache_compression.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --prompt "Hello, my name is" --compression_type l2_norm
+```
+
+### SnapKV
+
+Default parameters - 
+- Window size = 8
+- Compress length = 40
+- Kernel size = 5   
+
+```bash
+# SnapKV for prompt compression
+python generate_kv_cache_compression.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --prompt "Hello, my name is Victoria and I’m the owner of Sweet Treats Bakery. I opened my bakery in the charming town of Willow Creek, where everyone knows each other and the community comes together to support their local businesses. My bakery has been a staple in the town for years, serving up the most delicious baked goods, cakes, and pastries that make everyone’s taste buds dance with joy." --compression_type snapkv
+```
+
+### H2O - Heavy Hitter
+
+Default parameters - 
+- History window size = 1    
+- Attn thresholding = False 
+- H2O max cache size = 64   
+
+```bash
+python generate_kv_cache_compression.py --checkpoint_path checkpoints/$MODEL_REPO/model.pth --prompt "Hello, my name is" --compression_type heavy_hitter
 ```
 
 Or, with no KV Cache compression - 
